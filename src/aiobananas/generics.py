@@ -31,7 +31,7 @@ class BaseApiResponse(BaseModel):
     @validator("message")
     def message_must_not_contain_error(cls, v):
         if "error" in v.lower():
-            raise ValueError(f"error message: {v}")
+            raise Exception(v)
         return v
 
 
@@ -93,7 +93,7 @@ class Session:
                 raise Exception("server error: status code {}".format(response.status))
 
             try:
-                out = await response.json()
+                out = await response.json(content_type=None)
             except:
                 raise Exception("server error: returned invalid json")
 
@@ -117,7 +117,7 @@ class Session:
                 raise Exception("server error: status code {}".format(response.status))
 
             try:
-                out = await response.json()
+                out = await response.json(content_type=None)
             except:
                 raise Exception("server error: returned invalid json")
 
