@@ -1,0 +1,3 @@
+[flake8]
+exclude = .git,__pycache__,venv,.tox,.eggs,*.egg,build,podly-web-old,podly-web
+max-line-length = 120

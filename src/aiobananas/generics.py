@@ -1,7 +1,6 @@
-import json
 import os
 import time
-from typing import Generic, TypeVar
+from typing import Any, Generic, List, TypeVar
 from uuid import uuid4
 
 import aiohttp
@@ -20,37 +19,104 @@ if "BANANA_URL" in os.environ:
     print("Hitting endpoint:", endpoint)
 
 
-class BaseApiResponse(BaseModel):
-    """Base response schema"""
+TModelOutputs = TypeVar(
+    "TModelOutputs", bound=BaseModel | GenericModel | dict[str, Any]
+)
+TModelInputs = TypeVar("TModelInputs", bound=BaseModel | GenericModel | dict[str, Any])
+
+TOtherOutputs = TypeVar(
+    "TOtherOutputs", bound=BaseModel | GenericModel | dict[str, Any]
+)
+
+
+class Response(GenericModel, Generic[TModelOutputs]):
+    """End user response schema"""
 
     id: str
     message: str
     created: int
     apiVersion: str
+    modelOutputs: List[TModelOutputs]
 
-    @validator("message")
+
+class BaseApiResponse(GenericModel, Generic[TModelOutputs]):
+    """Shared API response schema"""
+
+    id: str
+    message: str
+    created: int
+    apiVersion: str
+    callID: str
+    modelOutputs: List[TModelOutputs] | None
+
+    @validator("message", pre=True)
     def message_must_not_contain_error(cls, v):
         if "error" in v.lower():
             raise Exception(v)
         return v
 
+    def as_response(self, model: type[TOtherOutputs]) -> Response[TOtherOutputs]:
+        if self.modelOutputs is None or len(self.modelOutputs) == 0:
+            raise ValueError("modelOutputs must not be None or empty")
 
-TModelOutputs = TypeVar("TModelOutputs", bound=BaseModel | GenericModel)
+        if model == dict[str, Any]:
+            if not isinstance(self.modelOutputs, dict):
+                modelOutputs = self.modelOutputs.dict()
+            else:
+                modelOutputs = self.modelOutputs
+        else:
+            if isinstance(self.modelOutputs, dict):
+                modelOutputs = model.parse_obj(self.modelOutputs)
+            else:
+                modelOutputs = self.modelOutputs
+
+        return Response[model](
+            id=self.id,
+            message=self.message,
+            created=self.created,
+            apiVersion=self.apiVersion,
+            modelOutputs=modelOutputs,
+        )
 
 
-class StartApiResponse(GenericModel, BaseApiResponse, Generic[TModelOutputs]):
+class StartApiResponse(BaseApiResponse[TModelOutputs], Generic[TModelOutputs]):
     """Session.start_api() response schema"""
 
-    callID: str
     finished: bool
-    modelOutputs: TModelOutputs | None
+
+    @validator("finished")
+    def model_outputs_must_match_finished(cls, v, values):
+        if v and (
+            not values.__contains__("modelOutputs")
+            or values["modelOutputs"] is None
+            or len(values["modelOutputs"]) == 0
+        ):
+            raise ValueError(
+                "modelOutputs must not be None or empty if finished is True"
+            )
+        elif (
+            not v
+            and values.__contains__("modelOutputs")
+            and values["modelOutputs"] is not None
+            and len(values["modelOutputs"]) != 0
+        ):
+            raise ValueError("modelOutputs must be None or empty if finished is False")
+        return v
+
+
+class CheckApiResponse(BaseApiResponse[TModelOutputs], Generic[TModelOutputs]):
+    """Session.check_api() response schema"""
 
     @validator("modelOutputs")
     def model_outputs_must_match_finished(cls, v, values):
-        if values["finished"] and v is None:
-            raise ValueError("modelOutputs must not be None if finished is True")
-        if not values["finished"] and v is not None:
-            raise ValueError("modelOutputs must be None if finished is False")
+        if values["message"] == "success" and v is None or len(v) == 0:
+            raise ValueError(
+                'modelOutputs must not be None or empry if message is "success"'
+            )
+        elif not (values["message"] == "success") and v is not None and len(v) != 0:
+            raise ValueError(
+                'modelOutputs must be None or empty if message is not "success"'
+            )
         return v
 
 
@@ -71,13 +137,17 @@ class Session:
     async def start_api(
         self,
         model_key: str,
-        model_inputs: dict,
+        model_inputs: TModelInputs,
         api_key: str | None = None,
         start_only: bool = False,
-    ):
+        output_as: type[TModelOutputs] = dict[str, Any],
+    ) -> StartApiResponse[TModelOutputs]:
         route_start = "start/v4/"
         url_start = self.endpoint + route_start
         api_key = api_key or self.api_key
+
+        if not isinstance(model_inputs, dict):
+            model_inputs = model_inputs.dict()
 
         payload = {
             "id": str(uuid4()),
@@ -93,13 +163,18 @@ class Session:
                 raise Exception("server error: status code {}".format(response.status))
 
             try:
-                out = await response.json(content_type=None)
-            except:
+                obj = await response.json(content_type=None)
+            except Exception:
                 raise Exception("server error: returned invalid json")
 
-            return StartApiResponse(**out)
+            return StartApiResponse[output_as].parse_obj(obj)
 
-    async def check_api(self, call_id: str, api_key: str | None = None):
+    async def check_api(
+        self,
+        call_id: str,
+        api_key: str | None = None,
+        output_as: type[TModelOutputs] = dict[str, Any],
+    ) -> CheckApiResponse[TModelOutputs]:
         route_check = "check/v4/"
         url_check = self.endpoint + route_check
         api_key = api_key or self.api_key
@@ -116,56 +191,54 @@ class Session:
             if response.status != 200:
                 raise Exception("server error: status code {}".format(response.status))
 
-            try:
-                out = await response.json(content_type=None)
-            except:
-                raise Exception("server error: returned invalid json")
-
-            try:
-                if "error" in out["message"].lower():
-                    raise Exception(out["message"])
-                return out
-            except Exception as e:
-                raise e
+            return CheckApiResponse[output_as].parse_raw(await response.text())
 
     async def run_main(
         self,
         model_key: str,
-        model_inputs: dict,
+        model_inputs: TModelInputs,
         api_key: str | None = None,
-    ):
+        output_as: type[TModelOutputs] = dict[str, Any],
+    ) -> Response[TModelOutputs]:
         result = await self.start_api(
-            model_key, model_inputs, api_key=api_key, start_only=False
+            model_key,
+            model_inputs,
+            api_key=api_key,
+            start_only=False,
+            output_as=output_as,
         )
 
         # likely we get results on first call
-        if result["finished"]:
-            dict_out = {
-                "id": result["id"],
-                "message": result["message"],
-                "created": result["created"],
-                "apiVersion": result["apiVersion"],
-                "modelOutputs": result["modelOutputs"],
-            }
-            return dict_out
+        if result.finished:
+            return result.as_response(output_as)
 
         # else it's long running, so poll for result
         while True:
-            dict_out = await self.check_api(api_key, result["callID"])
-            if dict_out["message"].lower() == "success":
-                return dict_out
+            result = await self.check_api(api_key, result.callID)
+            if result.message.lower() == "success":
+                return result.as_response(output_as)
 
     async def start_main(
         self,
         model_key: str,
-        model_inputs: dict,
+        model_inputs: TModelInputs,
         api_key: str | None = None,
-    ):
+        output_as: type[TModelOutputs] = dict[str, Any],
+    ) -> str:
         result = await self.start_api(
-            model_key, model_inputs, api_key=api_key, start_only=True
+            model_key,
+            model_inputs,
+            api_key=api_key,
+            start_only=True,
+            output_as=output_as,
         )
-        return result["callID"]
+        return result.callID
 
-    async def check_main(self, api_key: str, call_id: str):
-        dict_out = await self.check_api(api_key, call_id)
+    async def check_main(
+        self,
+        api_key: str,
+        call_id: str,
+        output_as: type[TModelOutputs] = dict[str, Any],
+    ) -> CheckApiResponse[TModelOutputs]:
+        dict_out = await self.check_api(api_key, call_id, output_as=output_as)
         return dict_out
