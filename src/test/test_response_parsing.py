@@ -73,6 +73,19 @@ def test_parse_start_api_response():
     should_not_throw(lambda x: x.update({"finished": False, "modelOutputs": None}))
 
 
+def test_parse_check_api_response():
+    sample = {
+        "id": "test",
+        "message": "running",
+        "created": 1671572924,
+        "apiVersion": "28 July 2022",
+        "modelOutputs": None,
+    }
+
+    response = CheckApiResponse.parse_obj(sample)
+    assert response.modelOutputs is None
+
+
 def test_parse_dict_model_outputs():
     response_dict = {
         "id": "123",
@@ -197,15 +210,13 @@ async def test_run_main(aioresponses):
                 "created": 123,
                 "message": "success",
                 "apiVersion": "test",
-                "callID": "123",
                 "modelOutputs": [{"test": "test"}],
             },
         )
 
-        request = OkInputs(test="test")
         response = await session.run_main(
             "test-model-key",
-            request,
+            model_inputs=OkInputs(test="test"),
             output_as=OkOutputs,
         )
 
